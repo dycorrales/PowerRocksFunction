@@ -62,11 +62,25 @@ namespace PowerRocksFunction
         }
         private async Task<SkillResponse> LaunchPowerRock()
         {
-            var usuario = await ObterDadosUsuario();
+            try
+            {
+                var usuario = await ObterDadosUsuario();
 
-            var response = ResponseBuilder.Tell($"Bem vindo ao PowerRocks {usuario.FullName}. Você quer saber seus dados de consumo de hoje ou do mês?");
-            response.Response.ShouldEndSession = false;
-            return response;
+                var response = ResponseBuilder.Tell($"Bem vindo ao PowerRocks {usuario.FullName}. Você quer saber seus dados de consumo de hoje ou do mês?");
+                response.Response.ShouldEndSession = false;
+                return response;
+            }
+            catch
+            {
+                var speech = new SsmlOutputSpeech
+                {
+                    Ssml = $"<speak>Ouve um erro ao solicitar seu consumo. <break time='0.5s'/> Tente novamente por favor</speak>"
+                };
+
+                var response = ResponseBuilder.Tell(speech);
+                response.Response.ShouldEndSession = false;
+                return response;
+            }
         }
         private SkillResponse FinallyAlexaSession()
         {
@@ -78,6 +92,7 @@ namespace PowerRocksFunction
             response.Response.ShouldEndSession = true;
             return response;
         }
+
         private async Task<SkillResponse> GetIntent(SkillRequest skillRequest, SkillResponse response)
         {
             var intentRequest = skillRequest.Request as IntentRequest;
@@ -91,44 +106,62 @@ namespace PowerRocksFunction
 
         private async Task<SkillResponse> PeriodoIntent(Intent intent, SkillResponse response)
         {
-            var periodo = intent.Slots["Periodo"].Value;
-            var periodoParse = DateTime.Parse(periodo, null, System.Globalization.DateTimeStyles.RoundtripKind);
-
-            var inicio = DateTime.Now;
-            var fim = DateTime.Now;
-
-            var primerDiaDoMes = new DateTime(DateTime.Today.Year, DateTime.Today.Month, 1);
-
-            if (periodoParse == primerDiaDoMes)
-                inicio = periodoParse;
-
-            var measurementsKinds = await ObterMeasurements(inicio, fim);
-            var measurements = measurementsKinds.FirstOrDefault().Measurements;
-
-            var consumoKwh = decimal.Zero;
-            var valorReais = decimal.Zero;
-
-            foreach (var measurement in measurements)
+            try
             {
-                consumoKwh += measurement.Value ?? 0;
+                var periodo = intent.Slots["Periodo"].Value;
+                var periodoParse = DateTime.Parse(periodo, null, System.Globalization.DateTimeStyles.RoundtripKind);
 
-                var intervalo = new TimeSpan(measurement.DateTime.Hour, measurement.DateTime.Minute, measurement.DateTime.Second);
+                var inicio = DateTime.Now;
+                var fim = DateTime.Now;
 
-                valorReais += CalcularValorTarifa(measurement);
+                var primerDiaDoMes = new DateTime(DateTime.Today.Year, DateTime.Today.Month, 1);
+
+                if (periodoParse == primerDiaDoMes)
+                    inicio = periodoParse;
+
+                var measurementsKinds = await ObterMeasurements(inicio, fim);
+                var measurements = measurementsKinds.FirstOrDefault().Measurements;
+
+                var consumoKwh = decimal.Zero;
+                var valorReais = decimal.Zero;
+
+                foreach (var measurement in measurements)
+                {
+                    consumoKwh += measurement.Value ?? 0;
+
+                    var intervalo = new TimeSpan(measurement.DateTime.Hour, measurement.DateTime.Minute, measurement.DateTime.Second);
+
+                    valorReais += CalcularValorTarifa(measurement);
+
+                    //Somar todas Pontas  * Tarifa Ponta
+                    //Somar todas fora ponta
+                    //Somar todo Intermediario
+                }
+
+                var speech = new SsmlOutputSpeech
+                {
+                    Ssml = $"<speak>Ummm, detectei que você esta conectado na CELESC. <break time='0.5s'/>" +
+                    $"Vou calcular seu consumo em reais. <break time='0.5s'/>" +
+                    $"Um momento por favor. <break time='1s'/>" +
+                    $"Seu consumo é de {consumoKwh:N0} kilo watts hora no valor de {valorReais:N2} reais" +
+                    $"</speak>"
+                };
+
+                response = ResponseBuilder.Tell(speech);
+                response.Response.ShouldEndSession = false;
+                return response;
             }
-
-            var speech = new SsmlOutputSpeech
+            catch
             {
-                Ssml = $"<speak>Ummm, detectei que você esta conectado na CELESC. <break time='0.5s'/>" +
-                $"Vou calcular seu consumo em reais. <break time='0.5s'/>" +
-                $"Um momento por favor. <break time='1s'/>" +
-                $"Seu consumo é de {consumoKwh:N0} kilo watts hora no valor de {valorReais:N2} reais" +
-                $"</speak>"
-            };
+                var speech = new SsmlOutputSpeech
+                {
+                    Ssml = $"<speak>Não reconheci o que você falou. <break time='0.5s'/> Você pode repetir por favor</speak>"
+                };
 
-            response = ResponseBuilder.Tell(speech);
-            response.Response.ShouldEndSession = false;
-            return response;
+                response = ResponseBuilder.Tell(speech);
+                response.Response.ShouldEndSession = false;
+                return response;
+            }
         }
 
         private async Task<Usuario> ObterDadosUsuario()
@@ -138,10 +171,9 @@ namespace PowerRocksFunction
 
             if (autenticacao != null)
             {
-                var configuracoes = ObterConfiguracoes();
-                var url = configuracoes["url"];
-                var subscriptionId = configuracoes["subscriptionId"];
-                var userId = configuracoes["userId"];
+                var url = _config["url"];
+                var subscriptionId = _config["subscriptionId"];
+                var userId = _config["userId"];
 
                 client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", autenticacao.Token);
                 var response = await client.GetAsync($"{url}{subscriptionId}/users/{userId}");
@@ -165,10 +197,9 @@ namespace PowerRocksFunction
 
             if (autenticacao != null)
             {
-                var configuracoes = ObterConfiguracoes();
-                var url = configuracoes["url"];
-                var subscriptionId = configuracoes["subscriptionId"];
-                var sdpId = configuracoes["sdpId"];
+                var url = _config["url"];
+                var subscriptionId = _config["subscriptionId"];
+                var sdpId = _config["sdpId"];
 
                 client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", autenticacao.Token);
 
@@ -246,10 +277,9 @@ namespace PowerRocksFunction
 
         private async Task<Autenticacao> Autenticar(HttpClient client)
         {
-            var configuracoes = ObterConfiguracoes();
-            var url = configuracoes["url"];
-            var usuario = configuracoes["usuario"];
-            var senha = configuracoes["senha"];
+            var url = _config["url"];
+            var usuario = _config["usuario"];
+            var senha = _config["senha"];
 
             client.DefaultRequestHeaders.Accept.Clear();
             client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
@@ -266,8 +296,6 @@ namespace PowerRocksFunction
             return null;
         }
 
-        private IConfiguration ObterConfiguracoes() => _config.GetSection("PowerHubApi");
-
         private class MeasurementsKind
         {
             public string MeasurementKind { get; set; }
@@ -279,10 +307,12 @@ namespace PowerRocksFunction
             public DateTime DateTime { get; set; }
             public decimal? Value { get; set; }
             public int ToU { get; set; }
-            public int TimeOfUse { get; set; }
+            public TimeOfUseEnum TimeOfUse { get; set; }
             public int ReactiveEnergyToU { get; set; }
             public int Quality { get; set; }
         }
+
+        private enum TimeOfUseEnum { Desconhecido = 0, HorarioPonta = 1, HorarioForaPonta = 2, Intermediario = 3 }
 
         private class Autenticacao
         {
