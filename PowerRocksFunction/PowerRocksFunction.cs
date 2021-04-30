@@ -12,81 +12,300 @@ using Alexa.NET.Request;
 using Alexa.NET.Response;
 using Alexa.NET.Request.Type;
 using Alexa.NET;
+using System.Net.Http.Headers;
+using System.Configuration;
+using Microsoft.Extensions.Configuration;
+using System.Text;
+using System.Net;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace PowerRocksFunction
 {
     public class PowerRocksFunction
     {
-        private readonly HttpClient _client;
-        public PowerRocksFunction(HttpClient client)
-        {
-            _client = client;
-        }
+        private IConfigurationRoot _config;
 
         [FunctionName("PowerRocksFunc")]
-        public async Task<IActionResult> Run(
+        public async Task<SkillResponse> Run(
             [HttpTrigger(AuthorizationLevel.Function, "get", "post", Route = null)] HttpRequest req,
-            ILogger log)
+            ILogger log, ExecutionContext context)
         {
+            _config = new ConfigurationBuilder()
+                .SetBasePath(context.FunctionAppDirectory)
+                .AddJsonFile("local.settings.json", optional: true, reloadOnChange: true)
+                .AddEnvironmentVariables()
+                .Build();
+
             log.LogInformation("Iniciou o Request da Alexa");
             string json = await req.ReadAsStringAsync();
             var skillRequest = JsonConvert.DeserializeObject<SkillRequest>(json);
-            return ProcessRequest(skillRequest);
-            //Alexa identifica comando
-            //Comando chama a API Azure functions
-            //API recebe um objeto do tipo SkillRequest
-            //Identifico SkillRequest qual a intenção
-            //Executo comando da intenção
+            return await ProcessRequest(skillRequest);
         }
-        private IActionResult ProcessRequest(SkillRequest skillRequest)
+        private async Task<SkillResponse> ProcessRequest(SkillRequest skillRequest)
         {
             var requestType = skillRequest.GetRequestType();
             SkillResponse response = null;
             if (requestType == typeof(LaunchRequest))
             {
-                response = LaunchPowerRock();
+                response = await LaunchPowerRock();
             }
             else if (requestType == typeof(IntentRequest))
             {
-                response = GetIntent(skillRequest, response);
+                response = await GetIntent(skillRequest, response);
             }
             else if (requestType == typeof(SessionEndedRequest))
             {
                 response = FinallyAlexaSession();
             }
-            return new OkObjectResult(response);
+            return response;
         }
-        private SkillResponse LaunchPowerRock()
+        private async Task<SkillResponse> LaunchPowerRock()
         {
-            SkillResponse response = ResponseBuilder.Tell("Bem vindo ao PowerRocks. O que você deseja saber?");
+            var usuario = await ObterDadosUsuario();
+
+            var response = ResponseBuilder.Tell($"Bem vindo ao PowerRocks {usuario.FullName}. Você quer saber seus dados de consumo de hoje ou do mês?");
             response.Response.ShouldEndSession = false;
             return response;
         }
         private SkillResponse FinallyAlexaSession()
         {
-            SkillResponse response;
-            var speech = new SsmlOutputSpeech();
-            speech.Ssml = $"<speak>Até mais Rocker</speak>";
-            response = ResponseBuilder.TellWithCard(speech, "Até mais Rocker", "PowerRock");
+            var speech = new SsmlOutputSpeech
+            {
+                Ssml = $"<speak>Até mais Rocker</speak>"
+            };
+            var response = ResponseBuilder.TellWithCard(speech, "Até mais Rocker", "PowerRock");
             response.Response.ShouldEndSession = true;
             return response;
         }
-        private SkillResponse GetIntent(SkillRequest skillRequest, SkillResponse response)
+        private async Task<SkillResponse> GetIntent(SkillRequest skillRequest, SkillResponse response)
         {
             var intentRequest = skillRequest.Request as IntentRequest;
-            if (intentRequest.Intent.Name == "HorarioForaPonta")
-            {
-                response = IntentHorarioPonta(response);
-            }
+            if (intentRequest.Intent.Name == "PeriodoIntent")
+                response = await PeriodoIntent(intentRequest.Intent, response);
+            else if (intentRequest.Intent.Name == "ContinuarIntent")
+                response = await PeriodoIntent(intentRequest.Intent, response);
+
             return response;
         }
-        private SkillResponse IntentHorarioPonta(SkillResponse response)
+
+        private async Task<SkillResponse> PeriodoIntent(Intent intent, SkillResponse response)
         {
-            var speech = new SsmlOutputSpeech();
-            speech.Ssml = $"<speak>Você esta no horário Fora Ponta</speak>";
-            response = ResponseBuilder.TellWithCard(speech, "Sua resposta é: ", "O horário é Fora Ponta");
+            var periodo = intent.Slots["Periodo"].Value;
+            var periodoParse = DateTime.Parse(periodo, null, System.Globalization.DateTimeStyles.RoundtripKind);
+
+            var inicio = DateTime.Now;
+            var fim = DateTime.Now;
+
+            var primerDiaDoMes = new DateTime(DateTime.Today.Year, DateTime.Today.Month, 1);
+
+            if (periodoParse == primerDiaDoMes)
+                inicio = periodoParse;
+
+            var measurementsKinds = await ObterMeasurements(inicio, fim);
+            var measurements = measurementsKinds.FirstOrDefault().Measurements;
+
+            var consumoKwh = decimal.Zero;
+            var valorReais = decimal.Zero;
+
+            foreach (var measurement in measurements)
+            {
+                consumoKwh += measurement.Value ?? 0;
+
+                var intervalo = new TimeSpan(measurement.DateTime.Hour, measurement.DateTime.Minute, measurement.DateTime.Second);
+
+                valorReais += CalcularValorTarifa(measurement);
+            }
+
+            var speech = new SsmlOutputSpeech
+            {
+                Ssml = $"<speak>Ummm, detectei que você esta conectado na CELESC. <break time='0.5s'/>" +
+                $"Vou calcular seu consumo em reais. <break time='0.5s'/>" +
+                $"Um momento por favor. <break time='1s'/>" +
+                $"Seu consumo é de {consumoKwh:N0} kilo watts hora no valor de {valorReais:N2} reais" +
+                $"</speak>"
+            };
+
+            response = ResponseBuilder.Tell(speech);
             response.Response.ShouldEndSession = false;
             return response;
+        }
+
+        private async Task<Usuario> ObterDadosUsuario()
+        {
+            using var client = new HttpClient();
+            var autenticacao = await Autenticar(client);
+
+            if (autenticacao != null)
+            {
+                var configuracoes = ObterConfiguracoes();
+                var url = configuracoes["url"];
+                var subscriptionId = configuracoes["subscriptionId"];
+                var userId = configuracoes["userId"];
+
+                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", autenticacao.Token);
+                var response = await client.GetAsync($"{url}{subscriptionId}/users/{userId}");
+
+                var conteudo = await response.Content.ReadAsStringAsync();
+
+                if (response.StatusCode == HttpStatusCode.OK)
+                {
+                    var usuario = JsonConvert.DeserializeObject<Usuario>(conteudo);
+                    if (usuario != null)
+                        return usuario;
+                }
+            }
+            return null;
+        }
+
+        private async Task<IEnumerable<MeasurementsKind>> ObterMeasurements(DateTime inicio, DateTime fim)
+        {
+            using var client = new HttpClient();
+            var autenticacao = await Autenticar(client);
+
+            if (autenticacao != null)
+            {
+                var configuracoes = ObterConfiguracoes();
+                var url = configuracoes["url"];
+                var subscriptionId = configuracoes["subscriptionId"];
+                var sdpId = configuracoes["sdpId"];
+
+                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", autenticacao.Token);
+
+                var result = await client.GetAsync($"{url}{subscriptionId}/sdps/{sdpId}/measurements?commaSeparatedMeasurements=ActiveEnergy&dayStart={inicio:yyyy-MM-dd}&dayEnd={fim:yyyy-MM-dd}");
+
+                var conteudo = await result.Content.ReadAsStringAsync();
+
+                if (result.StatusCode == HttpStatusCode.OK)
+                    return JsonConvert.DeserializeObject<IEnumerable<MeasurementsKind>>(conteudo);
+            }
+            return null;
+        }
+
+        private decimal CalcularValorTarifa(Measurements measurement)
+        {
+            var tarifaBranca = Tarifa();
+
+            var intervalo = new TimeSpan(measurement.DateTime.Hour, measurement.DateTime.Minute, measurement.DateTime.Second);
+
+            var valorReais = decimal.Zero;
+
+            if(intervalo.TotalSeconds >= tarifaBranca.Ponta.Inicio.TotalSeconds && intervalo.TotalSeconds <= tarifaBranca.Ponta.Fim.TotalSeconds)
+                valorReais = measurement.Value ?? 0;
+            if (intervalo.TotalSeconds >= tarifaBranca.ForaPonta.ToArray()[0].Inicio.TotalSeconds && intervalo.TotalSeconds <= tarifaBranca.ForaPonta.ToArray()[0].Fim.TotalSeconds)
+                valorReais = measurement.Value ?? 0;
+            if (intervalo.TotalSeconds >= tarifaBranca.ForaPonta.ToArray()[1].Inicio.TotalSeconds && intervalo.TotalSeconds <= tarifaBranca.ForaPonta.ToArray()[1].Fim.TotalSeconds)
+                valorReais = measurement.Value ?? 0;
+            if (intervalo.TotalSeconds >= tarifaBranca.Intermediario.ToArray()[0].Inicio.TotalSeconds && intervalo.TotalSeconds <= tarifaBranca.Intermediario.ToArray()[0].Fim.TotalSeconds)
+                valorReais = measurement.Value ?? 0;
+            if (intervalo.TotalSeconds >= tarifaBranca.Intermediario.ToArray()[1].Inicio.TotalSeconds && intervalo.TotalSeconds <= tarifaBranca.Intermediario.ToArray()[1].Fim.TotalSeconds)
+                valorReais = measurement.Value ?? 0;
+
+            return valorReais;
+        }
+
+        private TarifaBranca Tarifa() => new TarifaBranca
+        {
+            Ponta = new InfoTarifa()
+            {
+                Valor = decimal.Parse("0.83916"),
+                Inicio = new TimeSpan(18, 45, 00),
+                Fim = new TimeSpan(21, 30, 00)
+            },
+            ForaPonta = new List<InfoTarifa>() {
+                new InfoTarifa()
+                {
+                    Valor = decimal.Parse("0.39765"),
+                    Inicio = new TimeSpan(00, 00, 00),
+                    Fim = new TimeSpan(17, 30, 00)
+                },
+                new InfoTarifa()
+                {
+                    Valor = decimal.Parse("0.39765"),
+                    Inicio = new TimeSpan(22, 45, 00),
+                    Fim = new TimeSpan(23, 45, 00)
+                }
+            },
+            Intermediario = new List<InfoTarifa>()
+            {
+                new InfoTarifa()
+                {
+                    Valor = decimal.Parse("0.53394"),
+                    Inicio = new TimeSpan(17, 45, 00),
+                    Fim = new TimeSpan(18, 30, 00)
+                },
+                new InfoTarifa()
+                {
+                    Valor = decimal.Parse("0.53394"),
+                    Inicio = new TimeSpan(21, 30, 00),
+                    Fim = new TimeSpan(22, 30, 00)
+                }
+            }
+        };
+
+
+        private async Task<Autenticacao> Autenticar(HttpClient client)
+        {
+            var configuracoes = ObterConfiguracoes();
+            var url = configuracoes["url"];
+            var usuario = configuracoes["usuario"];
+            var senha = configuracoes["senha"];
+
+            client.DefaultRequestHeaders.Accept.Clear();
+            client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+            var respToken = await client.PostAsync(url + $"login?username={usuario}&password={senha}", null);
+            var conteudo = await respToken.Content.ReadAsStringAsync();
+
+            if (respToken.StatusCode == HttpStatusCode.OK)
+            {
+                var autenticacao = JsonConvert.DeserializeObject<Autenticacao>(conteudo);
+                if (autenticacao.Token != null)
+                    return autenticacao;
+            }
+            return null;
+        }
+
+        private IConfiguration ObterConfiguracoes() => _config.GetSection("PowerHubApi");
+
+        private class MeasurementsKind
+        {
+            public string MeasurementKind { get; set; }
+            public IEnumerable<Measurements> Measurements { get; set; }
+        }
+
+        private class Measurements
+        {
+            public DateTime DateTime { get; set; }
+            public decimal? Value { get; set; }
+            public int ToU { get; set; }
+            public int TimeOfUse { get; set; }
+            public int ReactiveEnergyToU { get; set; }
+            public int Quality { get; set; }
+        }
+
+        private class Autenticacao
+        {
+            public string Token { get; set; }
+        }
+
+        private class Usuario
+        {
+            public string FullName { get; set; }
+        }
+
+        private class TarifaBranca
+        {
+            public InfoTarifa Ponta { get; set; }
+            public IEnumerable<InfoTarifa> ForaPonta { get; set; }
+            public IEnumerable<InfoTarifa> Intermediario { get; set; }
+        }
+
+        private class InfoTarifa
+        {
+            public decimal Valor { get; set; }
+            public TimeSpan Inicio { get; set; }
+            public TimeSpan Fim { get; set; }
         }
     }
 }
